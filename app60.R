@@ -1,7 +1,6 @@
 ########################################################################
-# Bonifaz-INCMNSZ
+# AaData
 # Asistente de Análisis de Datos paso a paso (Shiny)
-# Instituto Nacional de Ciencias Médicas y Nutrición Salvador Zubirán
 #
 # Objetivo: permitir que investigadores SIN experiencia en programación
 # puedan cargar, limpiar, analizar y graficar sus datos respondiendo
@@ -22,6 +21,8 @@
 ## ---- 1. Verificación e instalación de paquetes necesarios ----------
 paquetes_requeridos <- c("shiny", "DT", "ggplot2", "dplyr", "tidyr",
                           "readxl", "writexl", "gridExtra", "survival", "nlme")
+# Nota: 'httr' y 'jsonlite' solo se necesitan si activas la "IA avanzada".
+# No son obligatorios; la app los verifica y avisa únicamente si los usas.
 
 paquetes_faltantes <- paquetes_requeridos[
   !(paquetes_requeridos %in% rownames(installed.packages()))
@@ -123,6 +124,71 @@ interpretar_p <- function(p, alfa = 0.05) {
 # Quita los acentos y la eñe de un texto (á->a, é->e, ñ->n, etc.)
 quitar_acentos <- function(x) {
   chartr("áéíóúÁÉÍÓÚñÑüÜ", "aeiouAEIOUnNuU", x)
+}
+
+# Copia un archivo subido a una ruta temporal CON la extensión correcta.
+# Shiny guarda los archivos con un nombre temporal que a veces no conserva la
+# extensión; sin ella, readxl intenta abrir el .xlsx como zip y falla. Con esto
+# nos aseguramos de que readxl reconozca el formato.
+preparar_ruta_excel <- function(datapath, nombre) {
+  ext <- tolower(tools::file_ext(nombre))
+  if (!ext %in% c("xlsx", "xls")) ext <- "xlsx"
+  tmp <- tempfile(fileext = paste0(".", ext))
+  file.copy(datapath, tmp, overwrite = TRUE)
+  tmp
+}
+
+# Traduce errores técnicos de lectura de Excel a un mensaje claro para el usuario.
+mensaje_error_lectura <- function(msg) {
+  if (grepl("zip|cannot be opened|Failed to open|not a zip|libxls|corrupt|evaluation error",
+            msg, ignore.case = TRUE)) {
+    paste0("El archivo no parece ser un Excel válido (puede estar dañado, o ser un CSV/HTML ",
+           "con extensión .xlsx). Sugerencia: ábrelo en Excel y usa 'Guardar como' \u2192 ",
+           "Libro de Excel (.xlsx), o guárdalo como CSV y súbelo así.")
+  } else {
+    msg
+  }
+}
+
+# ¿El archivo es en realidad una tabla HTML guardada como .xls/.xlsx?
+# (Común en exportaciones de sistemas clínicos y de laboratorio.)
+parece_html <- function(path) {
+  txt <- tryCatch(tolower(paste(readLines(path, n = 40, warn = FALSE), collapse = " ")),
+                  error = function(e) "")
+  grepl("<table|<html|<!doctype html|<tr|<td|<tbody|xmlns", txt)
+}
+
+# Intenta leer una tabla HTML (usa rvest/xml2 o XML si están instalados).
+leer_html_tabla <- function(path) {
+  if (requireNamespace("rvest", quietly = TRUE) && requireNamespace("xml2", quietly = TRUE)) {
+    return(tryCatch({
+      tabs <- rvest::html_table(xml2::read_html(path), fill = TRUE)
+      if (length(tabs) > 0) as.data.frame(tabs[[which.max(vapply(tabs, ncol, integer(1)))]])
+      else NULL
+    }, error = function(e) NULL))
+  }
+  if (requireNamespace("XML", quietly = TRUE)) {
+    return(tryCatch({
+      tabs <- XML::readHTMLTable(path, stringsAsFactors = FALSE)
+      tabs <- Filter(Negate(is.null), tabs)
+      if (length(tabs) > 0) tabs[[which.max(vapply(tabs, ncol, integer(1)))]] else NULL
+    }, error = function(e) NULL))
+  }
+  NULL
+}
+
+# Intenta leer texto delimitado probando varios separadores y se queda con el
+# que produce más columnas (útil cuando un "Excel" es en realidad texto).
+leer_texto_auto <- function(path) {
+  seps <- c(",", ";", "\t", "|")
+  mejor <- NULL; ncmax <- 1
+  for (s in seps) {
+    d <- tryCatch(read.csv(path, sep = s, stringsAsFactors = FALSE, check.names = FALSE,
+                           na.strings = c("NA", "", "NaN", "na", "N/A")),
+                  error = function(e) NULL)
+    if (!is.null(d) && ncol(d) > ncmax) { mejor <- d; ncmax <- ncol(d) }
+  }
+  mejor
 }
 
 # Convierte a numérico las columnas de texto que son numéricas salvo por
@@ -252,6 +318,203 @@ generar_datos_ejemplo <- function() {
   datos
 }
 
+## ---- Asistente inteligente (recomendaciones) ------------------------
+
+# Detecta si un nombre de variable sugiere tiempo, identificador de sujeto, etc.
+es_como_nombre <- function(nombre, patrones) {
+  any(grepl(paste(patrones, collapse = "|"), nombre, ignore.case = TRUE))
+}
+
+# Construye un "perfil" de la tabla actual: tamaño, tipos, grupos, faltantes,
+# si hay variable de tiempo o de identificación de sujeto, etc.
+perfil_datos <- function(df) {
+  n <- nrow(df); p <- ncol(df)
+  vars_num <- obtener_vars_numericas(df)
+  vars_cat <- obtener_vars_categoricas(df)
+  # variables de grupo candidatas: categóricas con 2 a 10 niveles
+  grupos_cand <- character(0)
+  niveles_grupo <- integer(0)
+  for (v in vars_cat) {
+    k <- length(unique(stats::na.omit(df[[v]])))
+    if (k >= 2 && k <= 10) { grupos_cand <- c(grupos_cand, v); niveles_grupo <- c(niveles_grupo, k) }
+  }
+  # variable de tiempo candidata
+  tiempo_cand <- names(df)[vapply(names(df), function(nm)
+    es_como_nombre(nm, c("dia", "día", "tiempo", "time", "semana", "week", "mes", "day", "visita")), logical(1))]
+  tiempo_cand <- intersect(tiempo_cand, c(vars_num, vars_cat))
+  # variable de identificación de sujeto
+  id_cand <- names(df)[vapply(names(df), function(nm)
+    es_como_nombre(nm, c("id", "raton", "ratón", "sujeto", "paciente", "folio", "muestra")), logical(1))]
+  # faltantes
+  pct_na <- round(100 * sum(is.na(df)) / (n * p), 1)
+  cols_con_na <- sum(vapply(df, function(x) any(is.na(x)), logical(1)))
+  # tamaño de muestra
+  tamano <- if (n < 15) "muy pequeña" else if (n <= 40) "pequeña"
+            else if (n <= 150) "moderada" else "grande"
+
+  list(
+    n = n, p = p, vars_num = vars_num, vars_cat = vars_cat,
+    grupos_cand = grupos_cand, niveles_grupo = niveles_grupo,
+    tiempo_cand = tiempo_cand, id_cand = id_cand,
+    pct_na = pct_na, cols_con_na = cols_con_na,
+    tamano = tamano,
+    hay_texto = any(vapply(df, is.character, logical(1)))
+  )
+}
+
+# Detecta la "intención" a partir del texto del propósito del usuario.
+detectar_intencion <- function(texto) {
+  t <- tolower(texto)
+  list(
+    comparar   = grepl("compar|diferenc|grupo|tratamiento|control|efecto|versus|vs", t),
+    relacion   = grepl("relaci|correlaci|asociaci|depende|influye|predic|regres", t),
+    tiempo     = grepl("tiempo|evoluci|progres|longitud|semana|d[ií]a|seguimiento|curva", t),
+    predecir   = grepl("predic|regres|model|estimar|probabil|riesgo|factor", t),
+    describir  = grepl("describ|resum|explor|caracteriz|general|panorama", t),
+    frecuencia = grepl("frecuen|proporci|porcentaje|cuent|distribuci[óo]n de categor", t),
+    superviv   = grepl("superviv|survival|kaplan|tiempo hasta|evento|mortal|reca[ií]da", t)
+  )
+}
+
+# Genera recomendaciones LOCALES (sin enviar datos a ningún servidor).
+recomendar_local <- function(df, proposito) {
+  pf <- perfil_datos(df)
+  intn <- detectar_intencion(if (is.null(proposito)) "" else proposito)
+
+  encabezado <- sprintf(
+    "Con base en tus datos (%d observaciones, %d variables; %d numéricas y %d categóricas; muestra %s; %.1f%% de datos faltantes)%s:",
+    pf$n, pf$p, length(pf$vars_num), length(pf$vars_cat), pf$tamano, pf$pct_na,
+    if (nzchar(trimws(proposito))) sprintf(" y tu objetivo (\u201c%s\u201d)", trimws(proposito)) else ""
+  )
+
+  # ---- Limpieza ----
+  limp <- character(0)
+  if (pf$pct_na > 0)
+    limp <- c(limp, sprintf("Tienes datos faltantes en %d columna(s). Si la muestra es %s, evita borrar filas a la ligera: valora conservar el máximo de datos y solo quitar NA en las variables que vayas a analizar.", pf$cols_con_na, pf$tamano))
+  if (pf$hay_texto)
+    limp <- c(limp, "Estandariza el texto de las variables categóricas (unifica mayúsculas/minúsculas y espacios) para que 'Control' y 'control' no se cuenten como grupos distintos.")
+  limp <- c(limp, "Detecta valores atípicos (outliers): con muestras pequeñas un solo dato extremo puede distorsionar todo; revísalos antes de decidir si son errores de captura.")
+  limp <- c(limp, "Revisa que las variables numéricas estén como número (no como texto) y limpia los nombres de columnas si traen acentos o símbolos.")
+  if (pf$n < 15)
+    limp <- c(limp, "Ojo: tu muestra es muy pequeña; eliminar filas reduce mucho el poder estadístico. Prefiere marcar/İmputar antes que borrar.")
+
+  # ---- Análisis ----
+  ana <- character(0)
+  hay_grupo <- length(pf$grupos_cand) > 0
+  dos_niveles <- hay_grupo && any(pf$niveles_grupo == 2)
+  mas_niveles <- hay_grupo && any(pf$niveles_grupo > 2)
+  no_param <- pf$tamano %in% c("muy pequeña", "pequeña")
+
+  if (intn$describir || length(proposito) == 0 || !nzchar(trimws(proposito)))
+    ana <- c(ana, "Empieza con estadística descriptiva (medias, medianas, desviaciones) para conocer tus variables antes de cualquier prueba.")
+  if (intn$comparar || hay_grupo) {
+    if (dos_niveles)
+      ana <- c(ana, sprintf("Para comparar 2 grupos%s usa %s.", 
+                            if (length(pf$grupos_cand)) paste0(" (ej. ", pf$grupos_cand[1], ")") else "",
+                            if (no_param) "la prueba de Mann-Whitney/Wilcoxon (no paramétrica, más segura con pocos datos)" else "la prueba t de Student (verifica antes la normalidad)"))
+    if (mas_niveles)
+      ana <- c(ana, sprintf("Para comparar más de 2 grupos usa %s.",
+                            if (no_param) "Kruskal-Wallis (no paramétrica)" else "ANOVA de una vía, con prueba post-hoc si sale significativa"))
+    ana <- c(ana, "Complementa el valor p con el tamaño del efecto (d de Cohen): con muestras pequeñas, una diferencia real puede no dar 'significativa' pero sí tener un efecto relevante.")
+  }
+  if (intn$tiempo && length(pf$tiempo_cand) > 0) {
+    if (length(pf$id_cand) > 0)
+      ana <- c(ana, "Como mides al mismo sujeto en varios momentos, el análisis correcto es un ANOVA de medidas repetidas / modelo mixto (toma en cuenta que las mediciones del mismo sujeto están correlacionadas).")
+    else
+      ana <- c(ana, "Para ver el cambio a lo largo del tiempo, resume la evolución (promedio ± error estándar por momento y grupo).")
+  }
+  if (intn$relacion)
+    ana <- c(ana, sprintf("Para relación entre dos variables numéricas usa correlación de %s; si son varias, una matriz de correlación.",
+                          if (no_param) "Spearman (por rangos, robusta con pocos datos)" else "Pearson"))
+  if (intn$predecir)
+    ana <- c(ana, "Si quieres predecir: regresión lineal para un desenlace numérico, o regresión logística para uno binario (sí/no). Con muestras pequeñas usa pocos predictores para no sobreajustar.")
+  if (intn$frecuencia)
+    ana <- c(ana, "Para variables categóricas usa tablas de frecuencias; para ver asociación entre dos categóricas, tabla de contingencia (chi-cuadrada, o Fisher si hay conteos pequeños).")
+  if (intn$superviv && length(pf$id_cand) > 0)
+    ana <- c(ana, "Si mides tiempo hasta un evento, usa análisis de supervivencia (Kaplan-Meier y prueba de log-rank entre grupos).")
+  if (length(ana) == 0)
+    ana <- c(ana, "Describe primero tus variables; luego, según lo que busques, compara grupos, mide relaciones o modela. Escribe tu objetivo arriba para una sugerencia más precisa.")
+  if (no_param)
+    ana <- c(ana, "Recomendación general: con tu tamaño de muestra prefiere pruebas no paramétricas y reporta intervalos de confianza.")
+
+  # ---- Gráficas ----
+  graf <- character(0)
+  if (intn$comparar || hay_grupo)
+    graf <- c(graf, sprintf("Para comparar grupos: %s.",
+                            if (pf$tamano %in% c("muy pequeña","pequeña"))
+                              "gráfica de violín o boxplot MOSTRANDO los puntos individuales (con pocos datos conviene ver cada observación), o barras con error estándar"
+                            else "boxplot o barras con error estándar (media ± EE)"))
+  if (intn$tiempo && length(pf$tiempo_cand) > 0) {
+    graf <- c(graf, "Para el tiempo: línea de tiempo con promedio ± error estándar por grupo.")
+    if (length(pf$id_cand) > 0)
+      graf <- c(graf, "Añade una gráfica de líneas individuales por sujeto (spaghetti) para ver la trayectoria de cada uno y detectar variabilidad.")
+  }
+  if (intn$relacion) {
+    graf <- c(graf, "Para relación entre dos variables: diagrama de dispersión.")
+    if (length(pf$vars_num) >= 3)
+      graf <- c(graf, "Para ver muchas variables a la vez: mapa de calor de correlaciones.")
+  }
+  if (intn$frecuencia || (!intn$comparar && !intn$relacion && !intn$tiempo))
+    graf <- c(graf, "Para distribuciones: histograma (numéricas) o gráfica de barras (categóricas).")
+  if (intn$superviv && length(pf$id_cand) > 0)
+    graf <- c(graf, "Para tiempo hasta un evento: curva de supervivencia de Kaplan-Meier.")
+  if (length(graf) == 0)
+    graf <- c(graf, "Empieza con histogramas para ver la forma de tus variables y boxplots para comparar entre grupos.")
+
+  list(encabezado = encabezado, limpieza = limp, analisis = ana, graficas = graf)
+}
+
+# Construye un resumen (SOLO METADATOS, nunca datos crudos) para la IA opcional.
+construir_resumen_ia <- function(df, proposito) {
+  pf <- perfil_datos(df)
+  descr_cols <- vapply(names(df), function(nm) {
+    x <- df[[nm]]
+    tipo <- if (is.numeric(x)) "numérica" else "categórica/texto"
+    k <- length(unique(stats::na.omit(x)))
+    na <- round(100 * mean(is.na(x)), 1)
+    sprintf("- %s: %s, %d valores distintos, %.0f%% faltantes", nm, tipo, k, na)
+  }, character(1))
+  paste0(
+    "Eres un bioestadístico que asesora a investigadores clínicos. Con base en el ",
+    "PERFIL de un conjunto de datos (no se incluyen los datos crudos por privacidad), ",
+    "recomienda de forma concreta y en español: (1) qué limpieza conviene, (2) qué ",
+    "análisis estadístico usar y (3) qué gráficas hacer. Considera el tamaño de muestra ",
+    "y el objetivo del usuario. Responde en 3 secciones breves con viñetas.\n\n",
+    sprintf("PERFIL: %d observaciones, %d variables. Muestra %s. %.1f%% de datos faltantes.\n",
+            pf$n, pf$p, pf$tamano, pf$pct_na),
+    "Variables:\n", paste(descr_cols, collapse = "\n"),
+    "\n\nObjetivo del usuario: ", if (nzchar(trimws(proposito))) proposito else "(no especificado)"
+  )
+}
+
+# Llama a la API de Anthropic (opcional). Devuelve el texto o un mensaje de error.
+llamar_anthropic <- function(prompt, api_key, modelo = "claude-3-5-sonnet-latest") {
+  if (!requireNamespace("httr", quietly = TRUE) || !requireNamespace("jsonlite", quietly = TRUE))
+    return("Para usar la IA avanzada instala los paquetes 'httr' y 'jsonlite' (install.packages(c('httr','jsonlite'))).")
+  cuerpo <- list(
+    model = modelo,
+    max_tokens = 1024,
+    messages = list(list(role = "user", content = prompt))
+  )
+  resp <- tryCatch(
+    httr::POST(
+      "https://api.anthropic.com/v1/messages",
+      httr::add_headers(`x-api-key` = api_key,
+                        `anthropic-version` = "2023-06-01",
+                        `content-type` = "application/json"),
+      body = jsonlite::toJSON(cuerpo, auto_unbox = TRUE),
+      encode = "raw"
+    ), error = function(e) NULL)
+  if (is.null(resp)) return("No se pudo conectar con la API (revisa tu conexión a internet).")
+  if (httr::status_code(resp) != 200)
+    return(sprintf("La API respondió con un error (código %s). Revisa tu clave de API.", httr::status_code(resp)))
+  datos <- tryCatch(jsonlite::fromJSON(httr::content(resp, as = "text", encoding = "UTF-8"),
+                                        simplifyVector = FALSE), error = function(e) NULL)
+  if (is.null(datos) || is.null(datos$content)) return("La API no devolvió texto utilizable.")
+  textos <- vapply(datos$content, function(b) if (!is.null(b$text)) b$text else "", character(1))
+  paste(textos, collapse = "\n")
+}
+
 ## ---- 3. Definición de los pasos del asistente ------------------------
 
 NOMBRES_PASOS <- c(
@@ -327,8 +590,8 @@ ui <- fluidPage(
   ),
 
   div(class = "titulo-app",
-      h2("Bonifaz-INCMNSZ"),
-      p("Asistente de análisis de datos paso a paso — Instituto Nacional de Ciencias Médicas y Nutrición Salvador Zubirán"),
+      h2("AaData"),
+      p("Asistente de análisis de datos paso a paso"),
       div(style = "float:right; margin-top:-38px;",
           actionButton("btn_restart", "Reiniciar", class = "btn-sm btn-light"))
   ),
@@ -337,7 +600,7 @@ ui <- fluidPage(
   uiOutput("cuerpo_asistente"),
 
   tags$footer(class = "pie",
-    "Bonifaz-INCMNSZ · Herramienta de apoyo para investigación clínica y básica (ej. modelos de artritis reumatoide en ratones) · No sustituye la asesoría de un bioestadístico."
+    "AaData · Asistente de análisis de datos paso a paso, para investigación clínica y básica (ej. modelos de artritis reumatoide en ratones) · No sustituye la asesoría de un bioestadístico. Por: Ing. Daniel Bonifaz-Calvo Ibarrola"
   )
 )
 
@@ -353,7 +616,8 @@ server <- function(input, output, session) {
     ultima_grafica = NULL,
     bitacora = character(0),
     resultados = list(),   # guarda el resultado más reciente de cada tipo de análisis
-    graficas = list()      # guarda la gráfica más reciente de cada tipo generado
+    graficas = list(),     # guarda la gráfica más reciente de cada tipo generado
+    reco = NULL            # recomendaciones del asistente inteligente
   )
 
   # Etiquetas legibles para cada tipo de gráfica (usadas en el reporte PDF)
@@ -410,6 +674,105 @@ server <- function(input, output, session) {
   observeEvent(input$btn_atras, { ir_atras() })
   observeEvent(input$btn_siguiente, { ir_siguiente() })
 
+  # Caja del Asistente inteligente, reutilizable en los pasos 4, 5 y 6.
+  # 'foco' es "limpieza", "analisis" o "graficas": define qué recomendación resalta.
+  caja_asistente <- function(foco) {
+    salida_id <- paste0("ia_salida_", foco)
+    div(style = "background:#fbf6f8; border:1px solid #eadfe4; border-radius:8px; padding:16px; margin-bottom:18px;",
+      tags$div(style = "font-weight:700; color:#7a1f3d; margin-bottom:6px;",
+               "\U0001F4A1 Asistente inteligente (opcional)"),
+      p(class = "ayuda", style = "margin-top:0;",
+        "Escribe para qué usarás tus datos y te sugiero qué hacer, según el tamaño de tu muestra ",
+        "y tu objetivo. Las recomendaciones se calculan en tu computadora; no se envían tus datos."),
+      textAreaInput("ia_proposito", NULL, width = "100%", height = "70px",
+                    placeholder = "Ej.: quiero comparar el puntaje clínico entre los grupos Control, AR y AR+Tratamiento a lo largo de los días."),
+      checkboxInput("ia_usar_api",
+                    "Usar IA en línea (avanzada) — requiere una clave de API de Anthropic; opcional.",
+                    value = FALSE),
+      conditionalPanel(
+        condition = "input.ia_usar_api == true",
+        passwordInput("ia_api_key", "Clave de API de Anthropic (sk-ant-...):", width = "100%"),
+        p(class = "ayuda", "Tus datos de pacientes NO se envían; solo nombres de variables, tipos, conteos y tu objetivo.")
+      ),
+      uiOutput("boton_descargar_claude"),
+      actionButton("ia_recomendar", "Obtener recomendaciones", class = "btn-primary"),
+      uiOutput(salida_id)
+    )
+  }
+
+  # Botón para descargar la app de Claude (la página detecta el sistema operativo).
+  output$boton_descargar_claude <- renderUI({
+    so <- Sys.info()[["sysname"]]
+    etiqueta <- if (so == "Windows") "Descargar Claude para Windows"
+                else if (so == "Darwin") "Descargar Claude para macOS"
+                else if (so == "Linux") "Descargar Claude para Linux"
+                else "Descargar Claude"
+    div(style = "margin: 4px 0 10px 0;",
+      tags$a(etiqueta, href = "https://claude.com/download", target = "_blank",
+             class = "btn btn-default btn-sm"),
+      span(class = "ayuda", style = "margin-left:8px;",
+           "Aplicación de escritorio de Claude (opcional).")
+    )
+  })
+
+  # Observador: genera las recomendaciones (local o vía API) al presionar el botón.
+  observeEvent(input$ia_recomendar, {
+    df <- datos_actuales()
+    if (is.null(df)) {
+      showNotification("Primero carga tus datos (paso 2) para poder recomendarte.",
+                       type = "warning", duration = 6); return()
+    }
+    proposito <- if (is.null(input$ia_proposito)) "" else input$ia_proposito
+
+    if (isTRUE(input$ia_usar_api) && nzchar(trimws(if (is.null(input$ia_api_key)) "" else input$ia_api_key))) {
+      showNotification("Consultando la IA avanzada...", type = "message", duration = 3)
+      prompt <- construir_resumen_ia(df, proposito)
+      texto <- tryCatch(llamar_anthropic(prompt, input$ia_api_key),
+                        error = function(e) paste("Error al consultar la IA:", conditionMessage(e)))
+      rv$reco <- list(modo = "api", texto = texto)
+    } else {
+      rv$reco <- c(list(modo = "local"), recomendar_local(df, proposito))
+    }
+    agregar_bitacora(sprintf("Asistente inteligente consultado (%s).",
+                              if (isTRUE(input$ia_usar_api)) "IA avanzada" else "local"))
+  })
+
+  # Render de la salida del asistente, enfocada según el paso.
+  render_reco <- function(foco) {
+    reco <- rv$reco
+    if (is.null(reco)) return(NULL)
+    contenedor <- function(...) div(style = "margin-top:14px; background:white; border-radius:6px; padding:14px; border:1px solid #eee;", ...)
+
+    if (identical(reco$modo, "api")) {
+      return(contenedor(
+        tags$div(style = "font-weight:600; color:#7a1f3d; margin-bottom:6px;", "Recomendación (IA avanzada)"),
+        tags$div(style = "white-space:pre-wrap; font-size:14px;", reco$texto)
+      ))
+    }
+    # modo local
+    secciones <- list(
+      limpieza = list(titulo = "Limpieza recomendada", items = reco$limpieza),
+      analisis = list(titulo = "Análisis recomendado", items = reco$analisis),
+      graficas = list(titulo = "Gráficas recomendadas", items = reco$graficas)
+    )
+    orden <- unique(c(foco, c("limpieza", "analisis", "graficas")))
+    bloques <- lapply(orden, function(k) {
+      s <- secciones[[k]]
+      resaltar <- identical(k, foco)
+      div(style = sprintf("margin-bottom:10px; %s", if (resaltar) "" else "opacity:0.75;"),
+          tags$div(style = "font-weight:600; color:#7a1f3d;", s$titulo),
+          tags$ul(lapply(s$items, function(x) tags$li(x))))
+    })
+    contenedor(
+      tags$div(style = "font-size:13px; color:#555; margin-bottom:8px;", reco$encabezado),
+      bloques
+    )
+  }
+
+  output$ia_salida_limpieza <- renderUI({ render_reco("limpieza") })
+  output$ia_salida_analisis <- renderUI({ render_reco("analisis") })
+  output$ia_salida_graficas <- renderUI({ render_reco("graficas") })
+
   ## =====================================================================
   ## CUERPO PRINCIPAL: se redibuja según el paso actual
   ## =====================================================================
@@ -419,11 +782,7 @@ server <- function(input, output, session) {
       ## ---------------- PASO 1: BIENVENIDA ----------------
       div(class = "caja",
         h3("¡Bienvenido(a)!"),
-        p("Esta aplicación te guiará, paso a paso, para analizar y graficar tus datos ",
-          "sin necesidad de escribir código en R."),
-        p("Está pensada para investigadores del área clínica y de ciencias básicas ",
-          "(por ejemplo, estudios con modelos murinos de artritis reumatoide), pero ",
-          "funciona con cualquier tabla de datos (archivo CSV o Excel)."),
+        p("Esta aplicación te guiará, paso a paso, para analizar y graficar tus datos."),
         tags$ul(
           tags$li("Paso 1: Bienvenida (aquí estás)"),
           tags$li("Paso 2: Cargar tu archivo de datos"),
@@ -525,6 +884,7 @@ server <- function(input, output, session) {
       vars_num <- obtener_vars_numericas(df)
       div(class = "caja",
         h3("¿Quieres limpiar tus datos?"),
+        caja_asistente("limpieza"),
         p("Selecciona las opciones de limpieza que quieras aplicar. Si no necesitas ",
           "limpiar nada, simplemente da clic en 'Siguiente'. Puedes marcar varias a la vez."),
 
@@ -592,6 +952,7 @@ server <- function(input, output, session) {
 
       div(class = "caja",
         h3("¿Qué tipo de análisis quieres hacer?"),
+        caja_asistente("analisis"),
         radioButtons("tipo_analisis", NULL,
           choices = c(
             "Estadística descriptiva (promedios, medianas, etc.)" = "descriptivo",
@@ -757,6 +1118,7 @@ server <- function(input, output, session) {
 
       div(class = "caja",
         h3("¿Quieres graficar tus datos?"),
+        caja_asistente("graficas"),
         radioButtons("tipo_grafica", NULL,
           choices = c(
             "Histograma (distribución de una variable)" = "histograma",
@@ -857,6 +1219,11 @@ server <- function(input, output, session) {
             p(class = "ayuda",
               "Incluye: resumen de los datos, el resultado más reciente de cada ",
               "análisis que hayas ejecutado, las gráficas que hayas generado, y la bitácora."),
+            textInput("responsable_analisis", "Nombre del responsable del análisis:",
+                      placeholder = "Ej. Daniel Bonifaz-Calvo"),
+            radioButtons("orientacion_pdf", "Orientación del reporte:",
+                         choices = c("Vertical" = "vertical", "Horizontal" = "horizontal"),
+                         selected = "vertical", inline = TRUE),
             downloadButton("descargar_pdf", "Descargar reporte completo (.pdf)", class = "btn-danger")
           ),
           column(4,
@@ -903,30 +1270,88 @@ server <- function(input, output, session) {
   observeEvent(input$archivo, {
     req(input$archivo)
     ext <- tolower(tools::file_ext(input$archivo$name))
+    origen <- input$archivo$datapath
+    nombre <- input$archivo$name
+
+    leer_csv <- function(path) {
+      sep <- if (is.null(input$csv_sep)) "," else input$csv_sep
+      dec <- if (is.null(input$csv_dec)) "." else input$csv_dec
+      enc <- if (is.null(input$csv_enc)) "UTF-8" else input$csv_enc
+      # "UTF-8-BOM" quita automáticamente el BOM que suele poner Excel.
+      fenc <- if (enc == "UTF-8") "UTF-8-BOM" else enc
+
+      intento <- function(fe, s) tryCatch(
+        read.csv(path, sep = s, dec = dec, fileEncoding = fe, stringsAsFactors = FALSE,
+                 check.names = FALSE, na.strings = c("NA", "", "NaN", "na", "N/A")),
+        error = function(e) NULL)
+
+      # 1) Con la configuración elegida por el usuario.
+      d <- intento(fenc, sep)
+      # 2) Si falla o sale en una sola columna, probar la otra codificación.
+      if (is.null(d) || ncol(d) <= 1) {
+        otro <- if (enc == "UTF-8") "latin1" else "UTF-8-BOM"
+        d2 <- intento(otro, sep)
+        if (!is.null(d2) && (is.null(d) || ncol(d2) > ncol(d))) d <- d2
+      }
+      # 3) Si sigue en una sola columna, autodetectar el separador.
+      if (is.null(d) || ncol(d) <= 1) {
+        d3 <- leer_texto_auto(path)
+        if (!is.null(d3) && (is.null(d) || ncol(d3) > ncol(d))) d <- d3
+      }
+      if (is.null(d)) stop("No se pudo leer el archivo CSV con la configuración indicada; prueba a cambiar el separador o la codificación.")
+      d
+    }
+    leer_excel <- function() {
+      as.data.frame(readxl::read_excel(preparar_ruta_excel(origen, nombre)))
+    }
+
+    # Intenta leer un archivo con extensión de Excel probando, en orden:
+    # Excel real -> tabla HTML -> texto delimitado. Devuelve data.frame o error.
+    leer_excel_o_alternativas <- function() {
+      df1 <- tryCatch(leer_excel(), error = function(e) NULL)
+      if (!is.null(df1) && ncol(df1) > 0) return(df1)
+      if (parece_html(origen)) {
+        df2 <- leer_html_tabla(origen)
+        if (!is.null(df2) && ncol(df2) > 0) {
+          showNotification("El archivo era una tabla HTML con extensión de Excel; se leyó correctamente.",
+                           type = "message", duration = 6)
+          return(df2)
+        }
+      }
+      df3 <- leer_texto_auto(origen)
+      if (!is.null(df3) && ncol(df3) > 1) {
+        showNotification("El archivo no era un Excel real; se leyó como texto delimitado.",
+                         type = "message", duration = 6)
+        return(df3)
+      }
+      stop("no-excel")  # activa el mensaje amigable
+    }
+
     df <- tryCatch({
       if (ext == "csv") {
-        sep <- if (is.null(input$csv_sep)) "," else input$csv_sep
-        dec <- if (is.null(input$csv_dec)) "." else input$csv_dec
-        enc <- if (is.null(input$csv_enc)) "UTF-8" else input$csv_enc
-        read.csv(input$archivo$datapath, sep = sep, dec = dec,
-                  fileEncoding = enc, stringsAsFactors = FALSE,
-                  na.strings = c("NA", "", "NaN", "na", "N/A"))
+        leer_csv(origen)
       } else if (ext %in% c("xlsx", "xls")) {
-        convertir_columnas_numericas(as.data.frame(readxl::read_excel(input$archivo$datapath)))
+        convertir_columnas_numericas(leer_excel_o_alternativas())
       } else {
-        stop("Formato de archivo no soportado. Usa .csv, .xlsx o .xls")
+        sig <- tryCatch(readBin(origen, what = "raw", n = 2), error = function(e) raw(0))
+        es_zip_xlsx <- length(sig) >= 2 && sig[1] == as.raw(0x50) && sig[2] == as.raw(0x4b) # "PK"
+        if (es_zip_xlsx) convertir_columnas_numericas(leer_excel_o_alternativas())
+        else convertir_columnas_numericas(leer_csv(origen))
       }
     }, error = function(e) {
-      showNotification(paste("Error al leer el archivo:", e$message),
-                        type = "error", duration = 8)
+      showNotification(paste("No se pudo leer el archivo:", mensaje_error_lectura(e$message)),
+                        type = "error", duration = 11)
       NULL
     })
 
-    if (!is.null(df)) {
+    if (!is.null(df) && ncol(df) > 0) {
       rv$datos_crudos <- df
       rv$datos_limpios <- NULL
       agregar_bitacora(sprintf("Se cargó el archivo '%s' (%d filas, %d columnas).",
                                 input$archivo$name, nrow(df), ncol(df)))
+    } else if (!is.null(df) && ncol(df) == 0) {
+      showNotification("El archivo se leyó pero no tiene columnas. Revisa el formato o el separador (si es CSV).",
+                       type = "warning", duration = 8)
     }
   })
 
@@ -942,11 +1367,12 @@ server <- function(input, output, session) {
   # (Se hace desde el servidor para no depender de condiciones del lado del cliente.)
   output$panel_avanzado <- renderUI({
     req(input$archivo_av)
-    hojas <- tryCatch(readxl::excel_sheets(input$archivo_av$datapath),
-                      error = function(e) NULL)
+    ruta_av <- preparar_ruta_excel(input$archivo_av$datapath, input$archivo_av$name)
+    hojas <- tryCatch(readxl::excel_sheets(ruta_av), error = function(e) NULL)
     if (is.null(hojas)) {
       return(div(style = "color:#b00020; margin-top:10px;",
-                 "No se pudo leer el archivo de Excel. Verifica que sea un .xlsx o .xls válido."))
+                 "No se pudo leer el archivo de Excel. Verifica que sea un .xlsx o .xls válido ",
+                 "(si lo abriste en Excel, prueba 'Guardar como' \u2192 Libro de Excel .xlsx)."))
     }
     tagList(
       selectInput("hoja_av", "¿Qué hoja quieres analizar?", choices = hojas, selected = hojas[1]),
@@ -972,8 +1398,9 @@ server <- function(input, output, session) {
   # Vista previa "cruda" de la hoja elegida (sin tratar ninguna fila como encabezado)
   output$preview_crudo_av <- renderTable({
     req(input$archivo_av, input$hoja_av)
+    ruta_av <- preparar_ruta_excel(input$archivo_av$datapath, input$archivo_av$name)
     crudo <- tryCatch(
-      readxl::read_excel(input$archivo_av$datapath, sheet = input$hoja_av,
+      readxl::read_excel(ruta_av, sheet = input$hoja_av,
                          col_names = FALSE, col_types = "text", n_max = 12,
                          .name_repair = "minimal"),
       error = function(e) NULL)
@@ -989,7 +1416,7 @@ server <- function(input, output, session) {
   # Construir la tabla plana a partir de la configuración del usuario
   observeEvent(input$construir_av, {
     req(input$archivo_av, input$hoja_av)
-    ruta <- input$archivo_av$datapath; hoja <- input$hoja_av
+    ruta <- preparar_ruta_excel(input$archivo_av$datapath, input$archivo_av$name); hoja <- input$hoja_av
     fh <- as.integer(input$fila_head_ini)
     nh <- as.integer(input$n_filas_head)
     fd <- as.integer(input$fila_datos_ini)
@@ -2110,7 +2537,7 @@ server <- function(input, output, session) {
   })
 
   output$descargar_grafica_png <- downloadHandler(
-    filename = function() paste0("grafica_bonifaz_", Sys.Date(), ".png"),
+    filename = function() paste0("grafica_aadata_", Sys.Date(), ".png"),
     content = function(file) {
       ggsave(file, plot = rv$ultima_grafica, width = 9, height = 6, dpi = 150)
     }
@@ -2121,20 +2548,27 @@ server <- function(input, output, session) {
   ## =====================================================================
 
   output$descargar_csv <- downloadHandler(
-    filename = function() paste0("datos_bonifaz_", Sys.Date(), ".csv"),
+    filename = function() paste0("datos_aadata_", Sys.Date(), ".csv"),
     content = function(file) {
       write.csv(datos_actuales(), file, row.names = FALSE, fileEncoding = "UTF-8")
     }
   )
 
   output$descargar_xlsx <- downloadHandler(
-    filename = function() paste0("datos_bonifaz_", Sys.Date(), ".xlsx"),
+    filename = function() paste0("datos_aadata_", Sys.Date(), ".xlsx"),
     content = function(file) {
       writexl::write_xlsx(datos_actuales(), file)
     }
   )
 
   # --- Funciones auxiliares para armar el reporte en PDF ---
+
+  # Pie de página del reporte (se dibuja al final de cada página)
+  pie_pagina_pdf <- function() {
+    grid::grid.text("Por: ing. Daniel Bonifaz-Calvo Ibarrola",
+                     x = 0.5, y = 0.02, just = c("center", "bottom"),
+                     gp = grid::gpar(fontsize = 9, col = "gray40", fontface = "italic"))
+  }
 
   # Escribe una o varias páginas de texto monoespaciado (con paginación automática)
   pagina_texto_pdf <- function(titulo, lineas, lineas_por_pagina = 48) {
@@ -2147,6 +2581,7 @@ server <- function(input, output, session) {
       grid::grid.text(paste(bloque, collapse = "\n"), x = 0.03, y = 0.92,
                        just = c("left", "top"),
                        gp = grid::gpar(fontsize = 8.5, fontfamily = "mono"))
+      pie_pagina_pdf()
     }
   }
 
@@ -2159,6 +2594,7 @@ server <- function(input, output, session) {
       tabla_grob,
       top = grid::textGrob(titulo, gp = grid::gpar(fontsize = 14, fontface = "bold", col = "#7a1f3d"))
     )
+    pie_pagina_pdf()
   }
 
   # Dibuja una página con una gráfica de ggplot2 y un título arriba
@@ -2168,25 +2604,36 @@ server <- function(input, output, session) {
       grafica,
       top = grid::textGrob(titulo, gp = grid::gpar(fontsize = 14, fontface = "bold", col = "#7a1f3d"))
     )
+    pie_pagina_pdf()
   }
 
   output$descargar_pdf <- downloadHandler(
-    filename = function() paste0("reporte_bonifaz_", Sys.Date(), ".pdf"),
+    filename = function() paste0("reporte_aadata_", Sys.Date(), ".pdf"),
     content = function(file) {
       df_actual <- datos_actuales()
       res <- rv$resultados
 
-      grDevices::pdf(file, width = 8.5, height = 11)
+      # Orientación elegida por el usuario: vertical (carta) u horizontal (apaisado).
+      orientacion <- if (is.null(input$orientacion_pdf)) "vertical" else input$orientacion_pdf
+      if (orientacion == "horizontal") {
+        pdf_ancho <- 11; pdf_alto <- 8.5
+      } else {
+        pdf_ancho <- 8.5; pdf_alto <- 11
+      }
+      grDevices::pdf(file, width = pdf_ancho, height = pdf_alto)
       on.exit(grDevices::dev.off(), add = TRUE)
 
       ## ---- Portada ----
       grid::grid.newpage()
-      grid::grid.text("Bonifaz-INCMNSZ", x = 0.5, y = 0.72,
+      grid::grid.text("AaData", x = 0.5, y = 0.72,
                        gp = grid::gpar(fontsize = 28, fontface = "bold", col = "#7a1f3d"))
       grid::grid.text("Reporte de análisis de datos", x = 0.5, y = 0.65,
                        gp = grid::gpar(fontsize = 16))
-      grid::grid.text("Instituto Nacional de Ciencias Médicas y Nutrición Salvador Zubirán",
-                       x = 0.5, y = 0.58, gp = grid::gpar(fontsize = 11))
+      responsable <- trimws(if (is.null(input$responsable_analisis)) "" else input$responsable_analisis)
+      if (nzchar(responsable)) {
+        grid::grid.text(sprintf("Análisis efectuado por: %s", responsable),
+                         x = 0.5, y = 0.58, gp = grid::gpar(fontsize = 13, fontface = "bold", col = "#333333"))
+      }
       grid::grid.text(paste("Generado:", format(Sys.time(), "%d/%m/%Y %H:%M")),
                        x = 0.5, y = 0.50, gp = grid::gpar(fontsize = 10, col = "gray40"))
       if (!is.null(df_actual)) {
@@ -2194,6 +2641,7 @@ server <- function(input, output, session) {
                                  nrow(df_actual), ncol(df_actual)),
                          x = 0.5, y = 0.45, gp = grid::gpar(fontsize = 10, col = "gray40"))
       }
+      pie_pagina_pdf()
 
       ## ---- Resumen de los datos ----
       if (!is.null(df_actual)) {
@@ -2235,10 +2683,10 @@ server <- function(input, output, session) {
   )
 
   output$descargar_reporte <- downloadHandler(
-    filename = function() paste0("bitacora_bonifaz_", Sys.Date(), ".txt"),
+    filename = function() paste0("bitacora_aadata_", Sys.Date(), ".txt"),
     content = function(file) {
       encabezado <- c(
-        "BONIFAZ-INCMNSZ - Bitacora de sesion de analisis de datos",
+        "AADATA - Bitacora de sesion de analisis de datos",
         paste("Generado:", Sys.time()),
         strrep("-", 60), ""
       )
