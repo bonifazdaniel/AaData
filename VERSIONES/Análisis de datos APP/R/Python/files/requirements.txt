@@ -1,0 +1,25 @@
+# Bonifaz-INCMNSZ — versión Python (Shiny for Python)
+# Instala con:  pip install -r requirements.txt
+
+# Núcleo de la app
+shiny>=1.0.0
+pandas>=2.0
+numpy>=1.24
+
+# Lectura de Excel (.xlsx / .xls)
+openpyxl>=3.1
+
+# --- Para las siguientes fases del port (ya se pueden instalar desde ahora) ---
+# Análisis estadístico (pruebas t, ANOVA, correlaciones, regresiones, etc.)
+scipy>=1.10
+statsmodels>=0.14
+
+# Gráficas (plotnine da una sintaxis tipo ggplot2, muy cercana a la versión R)
+matplotlib>=3.7
+plotnine>=0.12
+
+# Análisis de supervivencia (curva de Kaplan-Meier)
+lifelines>=0.27
+
+# Exportación del reporte a PDF
+reportlab>=4.0

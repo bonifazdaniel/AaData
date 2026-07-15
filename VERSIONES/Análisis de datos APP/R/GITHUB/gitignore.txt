@@ -1,0 +1,29 @@
+# --- Archivos de R / RStudio ---
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj
+
+# --- Salidas temporales que genera la app ---
+# Datos exportados y reportes generados durante el uso (no van al repositorio)
+datos_bonifaz_*.csv
+datos_bonifaz_*.xlsx
+reporte_bonifaz_*.pdf
+bitacora_bonifaz_*.txt
+grafica_bonifaz_*.png
+
+# --- Datos de pacientes / archivos sensibles ---
+# Evita subir bases de datos reales por accidente. Ajusta según necesites.
+*.xlsx
+*.xls
+*.csv
+!datos_ejemplo*.csv   # (si algún día quieres subir un ejemplo, renómbralo así)
+
+# --- Sistema operativo ---
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# --- Editores ---
+.vscode/
